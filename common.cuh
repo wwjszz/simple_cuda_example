@@ -12,7 +12,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <utility>
-
+#include <cassert>
 
 
 #define CHECK(call)\
@@ -78,13 +78,13 @@ std::uniform_int_distribution<int> random_generator::dist_int(0, 255);
 template<class T>
 concept arithmetic = std::is_arithmetic_v<T>;
 
+enum class device_type {
+    HOST, DEVICE
+};
+
 template<arithmetic T>
 class cuda_buffer {
 public:
-    enum class device_type {
-        HOST, DEVICE
-    };
-
     explicit cuda_buffer(const size_t size, device_type type = device_type::HOST) : data_(nullptr), size_(size), type_(type) {
         malloc(size);
     }
@@ -107,7 +107,7 @@ public:
         }
 
         if (type_ == device_type::HOST) {
-            data_ = malloc(size * sizeof(T));
+            data_ = static_cast<T *>(::malloc(size * sizeof(T)));
         } else {
             CHECK(cudaMalloc(&data_, size * sizeof(T)));
         }
@@ -117,7 +117,7 @@ public:
     void free() {
         if (data_ != nullptr) {
             if (type_ == device_type::HOST) {
-                free(data_);
+                ::free(data_);
             } else {
                 cudaFree(data_);
             }
