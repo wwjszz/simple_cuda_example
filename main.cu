@@ -107,7 +107,7 @@ __global__ void reduce_unroll(T* inbuf, T* out_buf, size_t n) {
 }
 
 template<arithmetic T>
-__global__ void reduce_unroll2(T* inbuf, T* out_buf, size_t n) {
+__global__ void reduce_roll(T* inbuf, T* out_buf, size_t n) {
     T *be_buf = inbuf + blockDim.x * blockIdx.x * 2;
     size_t tid = threadIdx.x;
     size_t idx = tid + blockIdx.x * blockDim.x * 2;
@@ -132,6 +132,72 @@ __global__ void reduce_unroll2(T* inbuf, T* out_buf, size_t n) {
     }
 }
 
+template<arithmetic T>
+__global__ void reduce_unroll(T* inbuf, T* out_buf, size_t n) {
+    T *be_buf = inbuf + blockDim.x * blockIdx.x * 2;
+    size_t tid = threadIdx.x;
+    size_t idx = tid + blockIdx.x * blockDim.x * 2;
+
+    if (idx > n) return;
+
+    if (tid < blockDim.x) {
+        be_buf[tid] += be_buf[tid + blockDim.x];
+    }
+    __syncthreads();
+
+    for (int stripe = blockDim.x >> 1; stripe > 32; stripe >>= 1) {
+        if (tid < stripe) {
+            be_buf[tid] += be_buf[tid + stripe];
+        }
+        __syncthreads();
+    }
+    if (tid < 32) {
+        volatile T* vmem = be_buf;
+        vmem[tid] += vmem[tid + 32];
+        vmem[tid] += vmem[tid + 16];
+        vmem[tid] += vmem[tid + 8];
+        vmem[tid] += vmem[tid + 4];
+        vmem[tid] += vmem[tid + 2];
+        vmem[tid] += vmem[tid + 1];
+    }
+
+    if (tid == 0) {
+        out_buf[blockIdx.x] = be_buf[0];
+    }
+}
+
+template<arithmetic T>
+__global__ void reduce_unroll_shfl(T* inbuf, T* out_buf, size_t n) {
+    T *be_buf = inbuf + blockDim.x * blockIdx.x * 2;
+    size_t tid = threadIdx.x;
+    size_t idx = tid + blockIdx.x * blockDim.x * 2;
+
+    if (idx > n) return;
+
+    if (tid < blockDim.x) {
+        be_buf[tid] += be_buf[tid + blockDim.x];
+    }
+    __syncthreads();
+
+    for (int stripe = blockDim.x >> 1; stripe > 32; stripe >>= 1) {
+        if (tid < stripe) {
+            be_buf[tid] += be_buf[tid + stripe];
+        }
+        __syncthreads();
+    }
+
+    if (tid < 32) {
+        T val = be_buf[tid] + be_buf[tid + 32];
+        val += __shfl_down_sync(0xFFFFFFFF, val, 16);
+        val += __shfl_down_sync(0xFFFFFFFF, val, 8);
+        val += __shfl_down_sync(0xFFFFFFFF, val, 4);
+        val += __shfl_down_sync(0xFFFFFFFF, val, 2);
+        val += __shfl_down_sync(0xFFFFFFFF, val, 1);
+        if (tid == 0) {
+            out_buf[blockIdx.x] = val;
+        }
+    }
+}
 
 template<arithmetic T>
 void check_result(std::string str,cuda_buffer<T> &odata_dev, cuda_buffer<T> &odata_host, T sum, size_t n) {
@@ -211,11 +277,29 @@ int main(int argc, char **argv) {
     idata_host.copy_to_device(idata_dev);
     CHECK(cudaDeviceSynchronize());
     {
-        cpu_time_scope cpu_time("reduce_unroll2");
-        reduce_unroll2<<<grid.x / 2, block>>>(idata_dev.data(), odata_dev.data(), size);
+        cpu_time_scope cpu_time("reduce_roll");
+        reduce_roll<<<grid.x / 2, block>>>(idata_dev.data(), odata_dev.data(), size);
         cudaDeviceSynchronize();
     }
-    check_result("reduce_unroll2", odata_dev, odata_host, cpu_sum, grid.x / 2);
+    check_result("reduce_roll", odata_dev, odata_host, cpu_sum, grid.x / 2);
+
+    idata_host.copy_to_device(idata_dev);
+    CHECK(cudaDeviceSynchronize());
+    {
+        cpu_time_scope cpu_time("reduce_unroll_shfl");
+        reduce_unroll_shfl<<<grid.x / 2, block>>>(idata_dev.data(), odata_dev.data(), size);
+        cudaDeviceSynchronize();
+    }
+    check_result("reduce_unroll_shfl", odata_dev, odata_host, cpu_sum, grid.x / 2);
+
+    idata_host.copy_to_device(idata_dev);
+    CHECK(cudaDeviceSynchronize());
+    {
+        cpu_time_scope cpu_time("reduce_unroll");
+        reduce_unroll<<<grid.x / 2, block>>>(idata_dev.data(), odata_dev.data(), size);
+        cudaDeviceSynchronize();
+    }
+    check_result("reduce_unroll", odata_dev, odata_host, cpu_sum, grid.x / 2);
 
     idata_host.copy_to_device(idata_dev);
     CHECK(cudaDeviceSynchronize());
