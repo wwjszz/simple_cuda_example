@@ -10,4 +10,5 @@ set(CMAKE_CUDA_ARCHITECTURES native)
 
 set(CMAKE_CUDA_FLAGS "-O3")
 
-add_executable(cuda main.cu)
+add_executable(reduce_kernel reduce_kernel.cu)
+add_executable(sgema_kernel sgema_kernel.cu)
