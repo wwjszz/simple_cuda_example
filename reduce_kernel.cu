@@ -1,332 +1,302 @@
 #include "common.cuh"
+#include <print>
 
+constexpr size_t ARRAY_SIZE = 1 << 26;
 
 template<arithmetic T>
-T cpu_reduction(cuda_buffer<T> &buf) {
-    T cpu_sum = 0;
-    for (int i = 0; i < buf.size(); i++)
-        cpu_sum += buf[i];
-    return cpu_sum;
+__host__ T cpu_reduce(host_buffer<T> &idata_host) {
+    T sum{};
+    for (T i: idata_host) sum += i;
+    return sum;
 }
 
-template<arithmetic T>
-__global__ void warmup(T* inbuf, T* out_buf, size_t n) {
-    T *be_buf = inbuf + blockDim.x * blockIdx.x;
-    size_t tid = threadIdx.x;
-    size_t idx = tid + blockIdx.x * blockDim.x;
+template<size_t BLOCK_SIZE, arithmetic T>
+__global__ void reduce_native_kernel(T *idata, T *odata, int N) {
+    __shared__ T sdata[BLOCK_SIZE];
 
-    if (idx >= n) return;
+    size_t thread_id = threadIdx.x;
+    size_t block_id = blockIdx.x;
+    size_t block_dim = blockDim.x;
+    size_t tid = block_dim * block_id + thread_id;
 
-    for (int stripe = 1; stripe < blockDim.x; stripe <<= 1) {
-        if ((tid % (2 * stripe)) == 0) {
-            be_buf[tid] += be_buf[tid + stripe];
+    // copy to shared
+    if (tid < N) sdata[thread_id] = idata[tid];
+    __syncthreads();
+
+    // thread sum
+    for (int s = 1; s < block_dim; s <<= 1) {
+        if ((thread_id % (s << 1) == 0) && (thread_id + s < block_dim) && (tid + s < N)) {
+            sdata[thread_id] += sdata[thread_id + s];
         }
         __syncthreads();
     }
 
-    if (tid == 0) {
-        out_buf[blockIdx.x] = be_buf[0];
+    if (thread_id == 0) {
+        odata[block_id] = sdata[0];
     }
 }
 
-template<arithmetic T>
-__global__ void reduce_neighbored_less(T* inbuf, T* out_buf, size_t n) {
-    T *be_buf = inbuf + blockDim.x * blockIdx.x;
-    size_t tid = threadIdx.x;
-    size_t idx = tid + blockIdx.x * blockDim.x;
+template<size_t BLOCK_SIZE, arithmetic T>
+__global__ void reduce_interleave_kernel(T *idata, T *odata, int N) {
+    __shared__ T sdata[BLOCK_SIZE];
 
-    if (idx > n) return;
+    size_t thread_id = threadIdx.x;
+    size_t block_id = blockIdx.x;
+    size_t block_dim = blockDim.x;
+    size_t tid = block_dim * block_id + thread_id;
 
-    for (int stripe = 1; stripe < blockDim.x; stripe <<= 1) {
-        int index = 2 * tid * stripe;
-        if (index < blockDim.x) {
-            be_buf[index] += be_buf[index + stripe];
+    // copy to shared
+    if (tid < N) sdata[thread_id] = idata[tid];
+    __syncthreads();
+
+    // thread sum
+    for (size_t s = 1; s < block_dim; s <<= 1) {
+        size_t index = thread_id * s * 2;
+        if (index + s < block_dim && (block_dim * block_id + index + s < N)) {
+            sdata[index] += sdata[index + s];
         }
         __syncthreads();
     }
 
-    if (tid == 0) {
-        out_buf[blockIdx.x] = be_buf[0];
+    if (thread_id == 0) {
+        odata[block_id] = sdata[0];
     }
 }
 
-template<arithmetic T>
-__global__ void reduce_interleaved(T* inbuf, T* out_buf, size_t n) {
-    T *be_buf = inbuf + blockDim.x * blockIdx.x;
-    size_t tid = threadIdx.x;
-    size_t idx = tid + blockIdx.x * blockDim.x;
+template<size_t BLOCK_SIZE, arithmetic T>
+__global__ void reduce_bank_conflict_kernel(T *idata, T *odata, int N) {
+    __shared__ T sdata[BLOCK_SIZE];
 
-    if (idx > n) return;
+    size_t thread_id = threadIdx.x;
+    size_t block_id = blockIdx.x;
+    size_t block_dim = blockDim.x;
+    size_t tid = block_dim * block_id + thread_id;
 
-    for (int stripe = blockDim.x >> 1; stripe > 0; stripe >>= 1) {
-        if (tid < stripe) {
-            be_buf[tid] += be_buf[tid + stripe];
+    // copy to shared
+    if (tid < N) sdata[thread_id] = idata[tid];
+    __syncthreads();
+
+    // thread sum
+    for (size_t s = block_dim >> 1; s > 0; s >>= 1) {
+        if (thread_id < s) {
+            sdata[thread_id] += sdata[thread_id + s];
         }
         __syncthreads();
     }
 
-    if (tid == 0) {
-        out_buf[blockIdx.x] = be_buf[0];
+    if (thread_id == 0) {
+        odata[block_id] = sdata[0];
     }
 }
 
-template<arithmetic T, std::size_t N>
-__global__ void reduce_unroll(T* inbuf, T* out_buf, size_t n) {
-    T *be_buf = inbuf + blockDim.x * blockIdx.x * N;
-    size_t tid = threadIdx.x;
-    size_t idx = tid + blockIdx.x * blockDim.x * N;
+template<size_t BLOCK_SIZE, arithmetic T>
+__global__ void reduce_idle_kernel(T *idata, T *odata, int N) {
+    int stride = 2;
+    __shared__ T sdata[BLOCK_SIZE];
 
-    if (idx > n) return;
+    size_t thread_id = threadIdx.x;
+    size_t block_id = blockIdx.x;
+    size_t block_dim = blockDim.x;
+    size_t tid = block_dim * block_id * stride + thread_id;
 
-    if (tid < blockDim.x) {
-        for (int i = 0; i < N; i++) {
-            be_buf[tid] += be_buf[tid + blockDim.x * (i + 1)];
-        }
+    // copy to shared
+    if (tid < N) {
+        sdata[thread_id] = idata[tid] + idata[tid + BLOCK_SIZE];
     }
     __syncthreads();
 
-    for (int stripe = blockDim.x >> 1; stripe > 32; stripe >>= 1) {
-        if (tid < stripe) {
-            be_buf[tid] += be_buf[tid + stripe];
+    // thread sum
+    for (size_t s = block_dim >> 1; s > 0; s >>= 1) {
+        if (thread_id < s) {
+            sdata[thread_id] += sdata[thread_id + s];
         }
         __syncthreads();
     }
-    if (tid < 32) {
-        volatile T* vmem = be_buf;
-        vmem[tid] += vmem[tid + 32];
-        vmem[tid] += vmem[tid + 16];
-        vmem[tid] += vmem[tid + 8];
-        vmem[tid] += vmem[tid + 4];
-        vmem[tid] += vmem[tid + 2];
-        vmem[tid] += vmem[tid + 1];
-    }
 
-    if (tid == 0) {
-        out_buf[blockIdx.x] = be_buf[0];
+    if (thread_id == 0) {
+        odata[block_id] = sdata[0];
     }
 }
 
-template<arithmetic T>
-__global__ void reduce_roll(T* inbuf, T* out_buf, size_t n) {
-    T *be_buf = inbuf + blockDim.x * blockIdx.x * 2;
-    size_t tid = threadIdx.x;
-    size_t idx = tid + blockIdx.x * blockDim.x * 2;
+template<size_t BLOCK_SIZE, arithmetic T>
+__global__ void reduce_wrap_unroll_kernel(T *idata, T *odata, int N) {
+    int stride = 2;
+    __shared__ T sdata[BLOCK_SIZE];
 
-    if (idx > n) return;
+    size_t thread_id = threadIdx.x;
+    size_t block_id = blockIdx.x;
+    size_t block_dim = blockDim.x;
+    size_t tid = block_dim * block_id * stride + thread_id;
 
-    if (tid < blockDim.x) {
-        be_buf[tid] += be_buf[tid + blockDim.x];
+    // copy to shared
+    if (tid < N) {
+        sdata[thread_id] = idata[tid] + idata[tid + BLOCK_SIZE];
     }
     __syncthreads();
 
-    for (int stripe = blockDim.x >> 1; stripe > 0; stripe >>= 1) {
-        if (tid < stripe) {
-            be_buf[tid] += be_buf[tid + stripe];
+    // thread sum
+    for (size_t s = block_dim >> 1; s > 32; s >>= 1) {
+        if (thread_id < s) {
+            sdata[thread_id] += sdata[thread_id + s];
         }
         __syncthreads();
     }
 
+    if (thread_id < 32) {
+        volatile T* vmem = sdata;
+        vmem[thread_id] += vmem[thread_id + 32];
+        vmem[thread_id] += vmem[thread_id + 16];
+        vmem[thread_id] += vmem[thread_id + 8];
+        vmem[thread_id] += vmem[thread_id + 4];
+        vmem[thread_id] += vmem[thread_id + 2];
+        vmem[thread_id] += vmem[thread_id + 1];
+    }
 
-    if (tid == 0) {
-        out_buf[blockIdx.x] = be_buf[0];
+    if (thread_id == 0) {
+        odata[block_id] = sdata[0];
     }
 }
 
-template<arithmetic T>
-__global__ void reduce_unroll(T* inbuf, T* out_buf, size_t n) {
-    T *be_buf = inbuf + blockDim.x * blockIdx.x * 2;
-    size_t tid = threadIdx.x;
-    size_t idx = tid + blockIdx.x * blockDim.x * 2;
+template<size_t BLOCK_SIZE, arithmetic T>
+__global__ void reduce_wrap_unroll_sync_warp_kernel(T *idata, T *odata, int N) {
+    int stride = 2;
+    __shared__ T sdata[BLOCK_SIZE];
 
-    if (idx > n) return;
+    size_t thread_id = threadIdx.x;
+    size_t block_id = blockIdx.x;
+    size_t block_dim = blockDim.x;
+    size_t tid = block_dim * block_id * stride + thread_id;
 
-    if (tid < blockDim.x) {
-        be_buf[tid] += be_buf[tid + blockDim.x];
+    // copy to shared
+    if (tid < N) {
+        sdata[thread_id] = idata[tid] + idata[tid + BLOCK_SIZE];
     }
     __syncthreads();
 
-    for (int stripe = blockDim.x >> 1; stripe > 32; stripe >>= 1) {
-        if (tid < stripe) {
-            be_buf[tid] += be_buf[tid + stripe];
+    // thread sum
+    for (size_t s = block_dim >> 1; s > 32; s >>= 1) {
+        if (thread_id < s) {
+            sdata[thread_id] += sdata[thread_id + s];
         }
         __syncthreads();
     }
-    if (tid < 32) {
-        volatile T* vmem = be_buf;
-        vmem[tid] += vmem[tid + 32];
-        vmem[tid] += vmem[tid + 16];
-        vmem[tid] += vmem[tid + 8];
-        vmem[tid] += vmem[tid + 4];
-        vmem[tid] += vmem[tid + 2];
-        vmem[tid] += vmem[tid + 1];
+
+    if (thread_id < 32) {
+        sdata[thread_id] += sdata[thread_id + 32];
+        __syncwarp();
+        sdata[thread_id] += sdata[thread_id + 16];
+        __syncwarp();
+        sdata[thread_id] += sdata[thread_id + 8];
+        __syncwarp();
+        sdata[thread_id] += sdata[thread_id + 4];
+        __syncwarp();
+        sdata[thread_id] += sdata[thread_id + 2];
+        __syncwarp();
+        sdata[thread_id] += sdata[thread_id + 1];
     }
 
-    if (tid == 0) {
-        out_buf[blockIdx.x] = be_buf[0];
+    if (thread_id == 0) {
+        odata[block_id] = sdata[0];
     }
 }
 
-template<arithmetic T>
-__global__ void reduce_unroll_shfl(T* inbuf, T* out_buf, size_t n) {
-    T *be_buf = inbuf + blockDim.x * blockIdx.x * 2;
-    size_t tid = threadIdx.x;
-    size_t idx = tid + blockIdx.x * blockDim.x * 2;
+template<size_t BLOCK_SIZE, arithmetic T>
+__global__ void reduce_wrap_unroll_shfl_down_sync_kernel(T *idata, T *odata, int N) {
+    int stride = 2;
+    __shared__ T sdata[BLOCK_SIZE];
 
-    if (idx > n) return;
+    size_t thread_id = threadIdx.x;
+    size_t block_id = blockIdx.x;
+    size_t block_dim = blockDim.x;
+    size_t tid = block_dim * block_id * stride + thread_id;
 
-    if (tid < blockDim.x) {
-        be_buf[tid] += be_buf[tid + blockDim.x];
+    // copy to shared
+    if (tid < N) {
+        sdata[thread_id] = idata[tid] + idata[tid + BLOCK_SIZE];
     }
     __syncthreads();
 
-    for (int stripe = blockDim.x >> 1; stripe > 32; stripe >>= 1) {
-        if (tid < stripe) {
-            be_buf[tid] += be_buf[tid + stripe];
+    // reduce
+    if (block_dim >= 256) {
+        if (thread_id < 128) {
+            sdata[thread_id] += sdata[thread_id + 128];
         }
         __syncthreads();
     }
 
-    if (tid < 32) {
-        T val = be_buf[tid] + be_buf[tid + 32];
-        val += __shfl_down_sync(0xFFFFFFFF, val, 16);
-        val += __shfl_down_sync(0xFFFFFFFF, val, 8);
-        val += __shfl_down_sync(0xFFFFFFFF, val, 4);
-        val += __shfl_down_sync(0xFFFFFFFF, val, 2);
-        val += __shfl_down_sync(0xFFFFFFFF, val, 1);
-        if (tid == 0) {
-            out_buf[blockIdx.x] = val;
+    if (block_dim >= 128) {
+        if (thread_id < 64) {
+            sdata[thread_id] += sdata[thread_id + 64];
         }
+        __syncthreads();
+    }
+
+    if (thread_id < 32) {
+        T val = sdata[thread_id] + sdata[thread_id + 32];
+        val +=  __shfl_down_sync(0xffffffff, val, 16);
+        val +=  __shfl_down_sync(0xffffffff, val, 8);
+        val +=  __shfl_down_sync(0xffffffff, val, 4);
+        val +=  __shfl_down_sync(0xffffffff, val, 2);
+        val +=  __shfl_down_sync(0xffffffff, val, 1);
+        if (thread_id == 0) odata[block_id] = val;
     }
 }
 
 template<arithmetic T>
-void check_result(std::string str,cuda_buffer<T> &odata_dev, cuda_buffer<T> &odata_host, T sum, size_t n) {
-    odata_dev.copy_to_host(odata_host);
-    T gpu_sum = 0;
-    for (int i = 0; i < n; i++) {
-        gpu_sum += odata_host[i];
+__host__ void check_result(std::string_view str, T cpu_result, device_buffer<T> &idata_device) {
+    host_buffer<T> idata_host = idata_device.gen_host();
+
+    T sum{};
+    for (T i: idata_host) sum += i;
+    std::cout << str << "\n\t > test sum=" << sum << std::endl;
+
+    if (sum != cpu_result) {
+        std::cout << "\t > ERROR at " << sum << " ref=" << cpu_result << std::endl;
+        return;
     }
-    // std::cout << str << " sum: " << gpu_sum << std::endl;
-    if (gpu_sum == sum) {
-        std::cout << str << " test success!" << std::endl;
-    }
+    std::cout << "\t > test success" << std::endl;
 }
 
-int main(int argc, char **argv) {
-    int dev = 0;
-    cudaDeviceProp prop{};
-    CHECK(cudaGetDeviceProperties(&prop, dev));
-    cudaSetDevice(dev);
 
-    int size = 1 << 24;
-    std::cout << "array size: " << size << std::endl;
-
-    //execution configuration
-    int blocksize = 1024;
-    if (argc > 1) {
-        blocksize = atoi(argv[1]);
-    }
-    dim3 block(blocksize, 1);
-    dim3 grid((size - 1) / block.x + 1, 1);
-    std::cout << "grid: " << grid.x << " block: " << block.x << std::endl;
-
-    cuda_buffer<int> idata_host(size);
-    cuda_buffer<int> odata_host(grid.x);
-    cuda_buffer<int> tmp(size);
+int main() {
+    host_buffer<long long> idata_host(ARRAY_SIZE);
+    device_buffer<long long> idata_device(ARRAY_SIZE);
 
     idata_host.initial_data();
-    idata_host.copy_to_host(tmp);
+    idata_host.copy_to_device(idata_device);
 
-    cuda_buffer<int> idata_dev(size, device_type::DEVICE);
-    cuda_buffer<int> odata_dev(grid.x, device_type::DEVICE);
-
-    int cpu_sum = 0;
+    long long cpu_sum = 0;
     {
-        cpu_time_scope cpu_time("cpu reduce");
-        cpu_sum = cpu_reduction(tmp);
-        std::cout << "CPU sum: " << cpu_sum << std::endl;
+        cpu_time_scope cpu_time("cpu_reduce");
+        cpu_sum = cpu_reduce(idata_host);
     }
 
-    idata_host.copy_to_device(idata_dev);
-    CHECK(cudaDeviceSynchronize());
-    {
-        cpu_time_scope cpu_time("warmup");
-        warmup<<<grid, block>>>(idata_dev.data(), odata_dev.data(), size);
-        cudaDeviceSynchronize();
-    }
-    check_result("warmup", odata_dev, odata_host, cpu_sum, grid.x);
+    constexpr int block_size = 256; // 1 << 8
+    constexpr int grid_size = CEIL_DIV(ARRAY_SIZE, block_size);
 
-    idata_host.copy_to_device(idata_dev);
-    CHECK(cudaDeviceSynchronize());
-    {
-        cpu_time_scope cpu_time("reduce_neighbored_less");
-        reduce_neighbored_less<<<grid, block>>>(idata_dev.data(), odata_dev.data(), size);
-        cudaDeviceSynchronize();
-    }
-    check_result("reduce_neighbored_less", odata_dev, odata_host, cpu_sum, grid.x);
+    device_buffer<long long> odata_device(grid_size);
 
-    idata_host.copy_to_device(idata_dev);
-    CHECK(cudaDeviceSynchronize());
-    {
-        cpu_time_scope cpu_time("reduce_interleaved");
-        reduce_interleaved<<<grid, block>>>(idata_dev.data(), odata_dev.data(), size);
-        cudaDeviceSynchronize();
-    }
-    check_result("reduce_interleaved", odata_dev, odata_host, cpu_sum, grid.x);
+    TEST_KERNEL(reduce_native_kernel<block_size>, grid_size, block_size, idata_device.data(), odata_device.data(), ARRAY_SIZE);
+    CHECK_RESULT(reduce_native_kernel<block_size>, cpu_sum, odata_device);
 
-    idata_host.copy_to_device(idata_dev);
-    CHECK(cudaDeviceSynchronize());
-    {
-        cpu_time_scope cpu_time("reduce_roll");
-        reduce_roll<<<grid.x / 2, block>>>(idata_dev.data(), odata_dev.data(), size);
-        cudaDeviceSynchronize();
-    }
-    check_result("reduce_roll", odata_dev, odata_host, cpu_sum, grid.x / 2);
+    TEST_KERNEL(reduce_interleave_kernel<block_size>, grid_size, block_size, idata_device.data(), odata_device.data(), ARRAY_SIZE);
+    CHECK_RESULT(reduce_interleave_kernel<block_size>, cpu_sum, odata_device);
 
-    idata_host.copy_to_device(idata_dev);
-    CHECK(cudaDeviceSynchronize());
-    {
-        cpu_time_scope cpu_time("reduce_unroll_shfl");
-        reduce_unroll_shfl<<<grid.x / 2, block>>>(idata_dev.data(), odata_dev.data(), size);
-        cudaDeviceSynchronize();
-    }
-    check_result("reduce_unroll_shfl", odata_dev, odata_host, cpu_sum, grid.x / 2);
+    TEST_KERNEL(reduce_bank_conflict_kernel<block_size>, grid_size, block_size, idata_device.data(), odata_device.data(), ARRAY_SIZE);
+    CHECK_RESULT(reduce_bank_conflict_kernel<block_size>, cpu_sum, odata_device);
 
-    idata_host.copy_to_device(idata_dev);
-    CHECK(cudaDeviceSynchronize());
-    {
-        cpu_time_scope cpu_time("reduce_unroll");
-        reduce_unroll<<<grid.x / 2, block>>>(idata_dev.data(), odata_dev.data(), size);
-        cudaDeviceSynchronize();
-    }
-    check_result("reduce_unroll", odata_dev, odata_host, cpu_sum, grid.x / 2);
+    device_buffer<long long> odata_idle_device(grid_size >> 1);
+    TEST_KERNEL(reduce_idle_kernel<block_size>, grid_size >> 1, block_size, idata_device.data(), odata_idle_device.data(), ARRAY_SIZE);
+    CHECK_RESULT(reduce_idle_kernel<block_size>, cpu_sum, odata_idle_device);
 
-    idata_host.copy_to_device(idata_dev);
-    CHECK(cudaDeviceSynchronize());
-    {
-        cpu_time_scope cpu_time("reduce_unroll<2>");
-        reduce_unroll <int, 2> << <grid.x / 2, block>> >(idata_dev.data(), odata_dev.data(), size);
-        cudaDeviceSynchronize();
-    }
-    check_result("reduce_unroll<2>", odata_dev, odata_host, cpu_sum, grid.x / 2);
+    TEST_KERNEL(reduce_wrap_unroll_kernel<block_size>, grid_size >> 1, block_size, idata_device.data(), odata_idle_device.data(), ARRAY_SIZE);
+    CHECK_RESULT(reduce_wrap_unroll_kernel<block_size>, cpu_sum, odata_idle_device);
 
-    idata_host.copy_to_device(idata_dev);
-    CHECK(cudaDeviceSynchronize());
-    {
-        cpu_time_scope cpu_time("reduce_unroll<4>");
-        reduce_unroll <int, 4> << <grid.x / 4, block>> >(idata_dev.data(), odata_dev.data(), size);
-        cudaDeviceSynchronize();
-    }
-    check_result("reduce_unroll<4>", odata_dev, odata_host, cpu_sum, grid.x / 4);
+    TEST_KERNEL(reduce_wrap_unroll_sync_warp_kernel<block_size>, grid_size >> 1, block_size, idata_device.data(), odata_idle_device.data(), ARRAY_SIZE);
+    CHECK_RESULT(reduce_wrap_unroll_sync_warp_kernel<block_size>, cpu_sum, odata_idle_device);
 
-    idata_host.copy_to_device(idata_dev);
-    CHECK(cudaDeviceSynchronize());
-    {
-        cpu_time_scope cpu_time("reduce_unroll<8>");
-        reduce_unroll <int, 8> << <grid.x / 8, block>> >(idata_dev.data(), odata_dev.data(), size);
-        cudaDeviceSynchronize();
-    }
-    check_result("reduce_unroll<8>", odata_dev, odata_host, cpu_sum, grid.x / 8);
+    TEST_KERNEL(reduce_wrap_unroll_shfl_down_sync_kernel<block_size>, grid_size >> 1, block_size, idata_device.data(), odata_idle_device.data(), ARRAY_SIZE);
+    CHECK_RESULT(reduce_wrap_unroll_shfl_down_sync_kernel<block_size>, cpu_sum, odata_idle_device);
 
     cudaDeviceReset();
     return EXIT_SUCCESS;
